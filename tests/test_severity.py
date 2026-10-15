@@ -47,3 +47,16 @@ def test_levels(config):
     assert severity_level(0.85, config) == "critical"
     assert is_critical(calculate_severity(1.0, 0.9, 0.95, config), config)
     assert not is_priority(0.5, config)
+
+
+def test_extent_separates_small_and_large_defects(config):
+    """A confident crack at fixed C scores by size: hairline below priority, long open crack critical."""
+    small = calculate_severity(1.0, 0.733, 1.0, config, extent=0.1)
+    large = calculate_severity(1.0, 0.733, 1.0, config, extent=0.85)
+    assert small < large
+    assert severity_level(small, config) == "medium"
+    assert is_critical(large, config)
+    assert calculate_severity(1.0, 0.733, 1.0, config, extent=None) == calculate_severity(1.0, 0.733, 1.0, config)
+    # the gate still uses the unscaled M: a small but certain new defect is not dropped to S = 0
+    s, significant = gated_severity(1.0, 0.733, 1.0, config, extent=0.0)
+    assert significant and s > 0

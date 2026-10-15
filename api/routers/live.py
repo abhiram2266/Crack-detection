@@ -27,7 +27,7 @@ class LiveStart(BaseModel):
     session_id: str
     camera_source: Optional[Union[int, str]] = None
     mode: str = "camera"                    # camera | browser
-    detection_mode: Optional[str] = None    # None = configured detector | full_frame
+    detection_mode: Optional[str] = None    # None = configured detector | full_frame | auto
     asset_type: Optional[str] = None        # for full_frame
 
 
@@ -39,12 +39,12 @@ class CaptureRequest(BaseModel):
 def live_start(body: LiveStart, _: Dict = Depends(operator_only), services: Services = Depends(get_services)) -> Dict[str, Any]:
     if body.mode not in {"camera", "browser"}:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "mode must be camera or browser")
-    if body.detection_mode not in {None, "full_frame", "yolo_world"}:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "detection_mode must be full_frame or yolo_world")
+    if body.detection_mode not in {None, "full_frame", "yolo_world", "auto"}:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "detection_mode must be auto, full_frame or yolo_world")
     try:
         return services.live.start(
             body.session_id, body.camera_source, body.mode,
-            "full_frame" if body.detection_mode == "full_frame" else None, body.asset_type,
+            body.detection_mode if body.detection_mode in {"full_frame", "auto"} else None, body.asset_type,
         )
     except KeyError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown session {body.session_id}") from exc

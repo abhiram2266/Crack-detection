@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, Optional, Union
 import cv2
 
 from ml.config import cfg
-from ml.detector import Detector, FullFrameDetector
+from ml.detector import AutoDetector, Detector, FullFrameDetector, YoloWorldDetector
 from ml.live.camera import CameraReader, FrameSource, PushFrameSource
 from ml.live.overlay import OverlayRenderer
 from ml.live.pipeline import LivePipeline
@@ -72,6 +72,11 @@ class LiveManager:
                     raise ValueError(f"No condition model for asset_type {at}")
                 self._saved_detector = self.engine.detector
                 self.engine.detector = FullFrameDetector(at, float(cfg(self.config, "detection", "full_frame_confidence")))
+            elif detection_mode == "auto" and not isinstance(self.engine.detector, AutoDetector):
+                use_yolo = cfg(self.config, "detection").get("auto_use_yolo", False)
+                yolo = self.engine.detector if use_yolo and isinstance(self.engine.detector, YoloWorldDetector) else None
+                self._saved_detector = self.engine.detector
+                self.engine.detector = AutoDetector(self.config, self.engine.embedder, yolo)
             frame_source: FrameSource = PushFrameSource() if mode == "browser" else self.camera_factory(source)
             self.pipeline = LivePipeline(self.config, self.engine, frame_source, session_id, self.publish)
             self.pipeline.start()

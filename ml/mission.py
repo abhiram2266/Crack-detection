@@ -9,13 +9,16 @@ Interrupted sessions (crash, §6.2) can be resumed or closed.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from memory.store import LocalStore
 from memory.sync import SyncManager
+from ml.config import cfg
+from ml.context_risk import ContextRiskService, haversine_km, locate_by_ip, place_name
 from ml.escalation import EscalationService
 from ml.reporting import build_report
-from ml.schemas import utc_now
+from ml.schemas import new_id, utc_now
 from ml.semantic_memory import SemanticMemoryEngine
 
 
@@ -24,11 +27,19 @@ class SessionStateError(Exception):
 
 
 class MissionService:
-    def __init__(self, store: LocalStore, engine: SemanticMemoryEngine, sync: SyncManager, escalation: EscalationService):
+    def __init__(
+        self,
+        store: LocalStore,
+        engine: SemanticMemoryEngine,
+        sync: SyncManager,
+        escalation: EscalationService,
+        context: Optional[ContextRiskService] = None,
+    ):
         self.store = store
         self.engine = engine
         self.sync = sync
         self.escalation = escalation
+        self.context = context
 
     def briefing(self, site_id: str) -> Dict[str, Any]:
         ranked = self.store.recompute_revisit(site_id, utc_now(), enqueue=False)
@@ -36,6 +47,7 @@ class MissionService:
         return {
             "site_id": site_id,
             "generated_ts": utc_now().isoformat(),
+            "context": self.context.for_site(site_id) if self.context else None,
             "assets_due": [
                 {
                     "asset_id": a["asset_id"],
@@ -53,15 +65,58 @@ class MissionService:
             "unresolved_defects": unresolved,
         }
 
-    def start(self, site_id: str, operator_id: str, simulated: bool = False) -> Dict[str, Any]:
+    def start(
+        self, site_id: str, operator_id: str, simulated: bool = False, location: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         if self.store.get_site(site_id) is None:
             raise KeyError(f"Unknown site: {site_id}")
         sync = self.sync.start_sync(site_id)
         if sync.get("pulled") and any(sync["pulled"].values()):
             self.engine.reload_index()
         session = self.store.create_session(site_id, operator_id, sync["mode"], sync, simulated)
+        if self.context:
+            # Weather changes, and a site without coordinates takes this device's position. Never blocks (NFR-3).
+            self.context.refresh_async(site_id, location)
         self.engine.start_prefetch(site_id)
         return {"session": session, "sync": sync, "briefing": self.briefing(site_id)}
+
+    def quick_start(self, operator_id: str, location: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Start a session here without choosing a site.
+
+        Memory is per site, so a site inspected before within sites.quick_start_radius_m of this
+        position is reused (its assets can be recognised); otherwise a new site is created at this
+        position and named after the place. Without a device position the IP position is used.
+        """
+        config = self.store.config
+        source = "device"
+        if location is None:
+            try:
+                location = locate_by_ip(config)
+                source = "ip"
+            except Exception as exc:  # noqa: BLE001
+                raise LookupError(f"No location: allow location in the browser ({exc})") from exc
+        lat, lon = float(location["latitude"]), float(location["longitude"])
+        radius_km = float(cfg(config, "sites", "quick_start_radius_m")) / 1000.0
+        nearest, best = None, None
+        for s in self.store.list_sites():
+            if s["latitude"] is None or s["longitude"] is None:
+                continue
+            d = haversine_km(lat, lon, s["latitude"], s["longitude"])
+            if d <= radius_km and (best is None or d < best):
+                nearest, best = s, d
+        if nearest is not None:
+            site = nearest
+            created = False
+        else:
+            name = location.get("place") or place_name(lat, lon, config) or f"Inspection {datetime.now():%d %b %Y %H:%M}"
+            site_id = new_id("site")
+            site = self.store.ensure_site(site_id, name, lat, lon)
+            created = True
+            if self.context:
+                self.context.record_location_source(site_id, {**location, "source": source})
+        out = self.start(site["site_id"], operator_id, location={**location} if source == "device" else None)
+        out["quick_start"] = {"site": site, "created": created, "distance_m": None if best is None else round(best * 1000), "location_source": source}
+        return out
 
     def end(self, session_id: str) -> Dict[str, Any]:
         session = self.store.get_session(session_id)

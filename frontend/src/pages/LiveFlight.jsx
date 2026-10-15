@@ -71,7 +71,8 @@ export default function LiveFlight() {
   const { sessionId } = useParams()
   const nav = useNavigate()
   const session = useAsync(() => getSession(sessionId), [sessionId])
-  const [form, setForm] = useState({ mode: 'camera', camera_source: '', detection_mode: '', asset_type: 'solar_panel' })
+  const [form, setForm] = useState({ mode: 'camera', camera_source: '', detection_mode: 'auto', asset_type: 'solar_panel' })
+  const [seen, setSeen] = useState({})
   const [status, setStatus] = useState(null)
   const [alerts, setAlerts] = useState([])
   const [banner, setBanner] = useState(null)
@@ -90,6 +91,22 @@ export default function LiveFlight() {
     if (msg.type === 'status') setStatus((s) => ({ ...(s || {}), ...msg.status }))
     if (msg.type === 'source_finished') refresh()
     if (msg.type === 'error') setError(msg.error)
+    if (msg.type === 'event' && msg.event.asset_id && ['new_asset', 'confirmed', 'change', 'duplicate'].includes(msg.event.type)) {
+      const ev = msg.event
+      // Memory panel: keep what memory held BEFORE this session (first event), update the current state.
+      setSeen((m) => {
+        const prev = m[ev.asset_id]
+        return {
+          ...m,
+          [ev.asset_id]: {
+            asset_id: ev.asset_id, asset_type: ev.asset_type, firstType: prev ? prev.firstType : ev.type,
+            history: prev ? prev.history : ev.history, context: ev.context || prev?.context,
+            label: ev.condition?.label, confidence: ev.condition?.confidence, severity: ev.severity_score,
+            level: ev.severity_level, change: ev.change, ts: ev.timestamp, count: (prev?.count || 0) + 1,
+          },
+        }
+      })
+    }
     if (msg.type === 'event' && msg.alert) {
       const ev = msg.event
       const a = {
@@ -116,6 +133,8 @@ export default function LiveFlight() {
     if (form.detection_mode === 'full_frame') {
       body.detection_mode = 'full_frame'
       body.asset_type = form.asset_type
+    } else if (form.detection_mode === 'auto') {
+      body.detection_mode = 'auto'
     }
     try {
       setStatus(await liveStart(body))
@@ -189,6 +208,7 @@ export default function LiveFlight() {
                 )}
                 <label className="field"><span>Detection</span>
                   <select value={form.detection_mode} onChange={(e) => setForm({ ...form, detection_mode: e.target.value })}>
+                    <option value="auto">Automatic (detects objects, or recognises the asset type of a close-up)</option>
                     <option value="">Configured detector (YOLO-World prompts)</option>
                     <option value="full_frame">Whole frame is one asset (close-up desk demo)</option>
                   </select>
@@ -221,6 +241,35 @@ export default function LiveFlight() {
               <dt>Skipped (duplicate / frame-skip)</dt><dd>{status?.counters?.skipped_duplicate ?? 0} / {status?.counters?.skipped_frame_skip ?? 0}</dd>
               <dt>Events socket</dt><dd><span className={`dot ${sock.connected ? 'ok' : 'warn'}`} /> {sock.connected ? 'connected' : 'reconnecting'}</dd>
             </dl>
+          </Card>
+
+          <Card title={`Memory: assets seen this session (${Object.keys(seen).length})`}>
+            {Object.keys(seen).length === 0 ? <div className="muted">Point the camera at a building, solar panel, pole or machine.</div> : (
+              <ul className="alert-list">
+                {Object.values(seen).sort((a, b) => (a.ts < b.ts ? 1 : -1)).map((a) => (
+                  <li key={a.asset_id} className={a.level === 'critical' || a.level === 'priority' ? a.level : ''}>
+                    <div className="row between">
+                      <strong>{a.asset_type} · {a.firstType === 'new_asset' ? 'NEW (first time seen)' : 'SEEN BEFORE'}</strong>
+                      <Link to={`/assets/${a.asset_id}`} className="mono small">{a.asset_id}</Link>
+                    </div>
+                    {a.history && (
+                      <div className="small">
+                        Last inspected {when(a.history.last_checked_ts)} · was <strong>{a.history.previous_condition}</strong>
+                        {a.history.previous_severity !== null && a.history.previous_severity !== undefined && <> · severity then {fmt(a.history.previous_severity)}</>}
+                        {a.history.open_defects?.length ? <> · {a.history.open_defects.length} open defect(s)</> : null}
+                      </div>
+                    )}
+                    <div className="small">
+                      Now <strong>{a.label}</strong> ({fmt(a.confidence)}) · severity {fmt(a.severity)} {a.level}
+                      {a.change?.since_last_visit
+                        ? <> · <strong>{a.change.since_last_visit.significant ? 'CHANGED since last visit' : 'no change since last visit'}</strong></>
+                        : a.firstType === 'new_asset' && <> · first inspection</>}
+                    </div>
+                    {a.context && <div className="small muted">Site context {a.context.level} (K {fmt(a.context.score)}) · criticality ×{fmt(a.context.criticality_multiplier)}</div>}
+                  </li>
+                ))}
+              </ul>
+            )}
           </Card>
 
           <Card title={`Alerts (${alerts.length})`}>

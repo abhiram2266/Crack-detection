@@ -1,0 +1,11 @@
+{
+  "region_id": "chennai",
+  "name": "Chennai, Tamil Nadu",
+  "bbox": {"min_lat": 12.80, "max_lat": 13.25, "min_lon": 80.05, "max_lon": 80.35},
+  "seismic": {
+    "zone": "III",
+    "zone_factor": 0.16,
+    "max_zone_factor": 0.36,
+    "source": "BIS IS 1893 (Part 1):2016, Table 3 (zone factors II 0.10, III 0.16, IV 0.24, V 0.36) and Annex E (Chennai: Zone III)"
+  }
+}

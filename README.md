@@ -47,6 +47,26 @@ can be DINOv2, ResNet or a projection embedder; the detector can be YOLO-World o
 the vector backend can be NumPy or FAISS (opt-in); and the cloud store is an HTTP client.
 Every tunable number is in `config.yaml`.
 
+## Quick start: test cracks (no dataset or training needed)
+
+The trained classifiers (`models/condition_classifier.pt`, `models/asset_type_classifier.npz`)
+and the YOLO-World weights are committed, so you can skip `make data` and `make train`.
+DINOv2 and CLIP download automatically on first start (~450 MB, needs internet once).
+
+```bash
+# Windows (PowerShell): python -m venv .venv; .venv\Scripts\pip install -r requirements.txt
+make setup                              # .venv + Python deps + frontend deps
+.venv/bin/python scripts/seed_users.py  # creates admin / operator / maintenance users
+# passwords are in data/credentials.env (or set AUDI_ADMIN_PASSWORD etc. before seeding)
+.venv/bin/python run_api.py             # terminal 1 → API on http://127.0.0.1:8000
+cd frontend && npm run dev              # terminal 2 → UI on http://localhost:5173
+```
+
+Sign in, open **Preflight → Start new session here** (allow location access), point the
+camera at a crack, then end the session to get the report. Severity scales with the crack's
+size (`severity.extent` in `config.yaml`); re-inspecting the same crack in a later session
+shows it under "Re-inspected assets" with the previous severity.
+
 ## Setup
 
 Requires Python 3.11 or 3.12, Node 18+, and macOS, Linux or Windows. `auto` device selection
@@ -159,6 +179,33 @@ colour cast, perspective, crop).
 | NFR-2 identity cascade @ 5,000 assets, after session-start prefetch | p95 32.3 ms (p50 9.7) | ≤ 50 ms |
 | NFR-2, cold feature cache | p95 32.4 ms | ≤ 50 ms |
 | NFR-3 worst start/end sync (cloud down / black-holed / slow / healthy) | 10.03 s, then offline | ≤ 10 s |
+
+## Context-aware site risk (Chennai)
+
+`ml/context_risk.py` scores how risky a site's surroundings are, using real public data for
+the site's latitude/longitude. Missing data is reported as "n/a" and left out of the score.
+
+| Factor | Source |
+|---|---|
+| Seismic zone | BIS IS 1893 (Part 1):2016, Chennai = Zone III, Z = 0.16 (`ml/regions/chennai.json`) |
+| Earthquake history | USGS catalogue, largest M≥3 within 300 km since 1900 |
+| Rain forecast / past 30-day rain / wind gusts | Open-Meteo (IMD thresholds: 115.6 mm/day very heavy rain, 118 km/h very severe cyclone) |
+| Occupancy | OpenStreetMap tags (hospital, school, apartments …), or admin entry |
+| Building age | Admin-entered construction year, or OpenStreetMap `start_date` |
+
+The context score K ∈ [0,1] is the weighted mean of the available factors (weights in
+`config.yaml → context_risk`; expert-set, not learned). It raises asset criticality,
+`C' = min(1, C·(1 + 0.5·K))`, which feeds `S = (w1·M + w2·C')·Cf`, and adds `w6·K` to
+revisit priority. Data is fetched in the background when a site is created or a session
+starts, cached for 6 h in the Local DB, and never fetched on the per-frame path.
+
+```bash
+python scripts/context_demo.py --place "Rajiv Gandhi Government General Hospital, Chennai"     --place "Ambattur Industrial Estate, Chennai" --image wall.jpg --image wall.jpg
+```
+
+API: `GET /api/sites/{id}/context`, admin `POST /api/admin/sites/{id}/context/refresh` and
+`PUT /api/admin/sites/{id}/context` (`construction_year`, `occupancy`). The pre-flight
+briefing and post-flight report show the factors and their evidence.
 
 ## Limitations
 

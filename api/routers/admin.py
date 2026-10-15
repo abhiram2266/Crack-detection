@@ -31,8 +31,8 @@ def apply_to_services(services: Services, view: Dict[str, Any]) -> None:
     engine = services.engine
     engine.change_detector = ConditionVisualChangeDetector(services.config, services.embedder)
     engine.resolution_missions = int(view["resolution_suggestion_missions"])
-    if prompts_changed and cfg(services.config, "detection", "mode") == "yolo_world":
-        detector = build_detector(services.config)
+    if prompts_changed and cfg(services.config, "detection", "mode") in {"yolo_world", "auto"}:
+        detector = build_detector(services.config, services.embedder)
         services.detector = detector
         engine.detector = detector
 
@@ -90,7 +90,39 @@ def create_site(body: SiteCreate, _: Dict = Depends(admin_only), services: Servi
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "site_id: letters, digits, _ and - only (max 64)")
     if services.store.get_site(body.site_id) is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "Site already exists")
-    return services.store.ensure_site(body.site_id, body.name, body.latitude, body.longitude)
+    site = services.store.ensure_site(body.site_id, body.name, body.latitude, body.longitude)
+    if body.latitude is not None and body.longitude is not None:
+        services.context.refresh_async(body.site_id)   # otherwise located from the device at the first session
+    return site
+
+
+class SiteContextAttributes(BaseModel):
+    construction_year: Optional[int] = Field(default=None, ge=1800, le=2100)
+    occupancy: Optional[str] = None
+
+
+@router.put("/sites/{site_id}/context")
+def set_site_context(
+    site_id: str, body: SiteContextAttributes, _: Dict = Depends(admin_only), services: Services = Depends(get_services)
+) -> Dict[str, Any]:
+    """Facts public data lacks (construction year, occupancy); the cached context is re-scored at once."""
+    if services.store.get_site(site_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown site {site_id}")
+    table = cfg(services.config, "context_risk", "occupancy_scores")
+    if body.occupancy is not None and body.occupancy.lower() not in table:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"occupancy must be one of {sorted(table)}")
+    return {"context": services.context.set_attributes(site_id, body.model_dump()), "attributes": services.context.attributes(site_id)}
+
+
+@router.post("/sites/{site_id}/context/refresh")
+def refresh_site_context(site_id: str, _: Dict = Depends(admin_only), services: Services = Depends(get_services)) -> Dict[str, Any]:
+    """Fetch real context data now (Open-Meteo, USGS, OpenStreetMap) for the site's coordinates."""
+    if services.store.get_site(site_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown site {site_id}")
+    result = services.context.refresh(site_id, force=True)
+    if result is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Site has no latitude/longitude")
+    return {"context": result}
 
 
 class UserCreate(BaseModel):

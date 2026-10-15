@@ -12,6 +12,7 @@ from auth.security import load_secret
 from memory.cloud_store_interface import CloudStoreInterface, HttpCloudStore
 from memory.store import LocalStore
 from memory.sync import SyncManager
+from ml.context_risk import ContextRiskService
 from ml.condition_classifier import ConditionClassifier, load_condition_classifier
 from ml.config import cfg
 from ml.detector import Detector, build_detector
@@ -39,6 +40,7 @@ class Services:
     hub: Hub
     jwt_secret: str
     live: Any = None
+    context: Optional[ContextRiskService] = None
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -70,15 +72,17 @@ def build_services(
     store.ensure_site(site["default_site_id"], site["default_site_name"])
     embedder = embedder or AssetEmbeddingModel.from_config(config)
     classifier = classifier or load_condition_classifier(config, embedder)
-    detector = detector or build_detector(config)
+    detector = detector or build_detector(config, embedder)
     engine = SemanticMemoryEngine(config, store, embedder, classifier, detector)
+    context = ContextRiskService(config, store)
+    engine.context = context
     if cloud is None and use_cloud:
         cloud = build_cloud(config)
     sync = SyncManager(config, store, cloud)
     hub = Hub(int(cfg(config, "live", "ws_queue_size")))
     escalation = EscalationService(config, store, publisher=hub.publish_to_user)
     engine.add_listener(escalation.on_event)
-    mission = MissionService(store, engine, sync, escalation)
+    mission = MissionService(store, engine, sync, escalation, context)
     a = cfg(config, "auth")
     secret = load_secret(a["secret_env"], a["secret_file"])
-    return Services(config, store, embedder, classifier, detector, engine, sync, escalation, mission, hub, secret)
+    return Services(config, store, embedder, classifier, detector, engine, sync, escalation, mission, hub, secret, context=context)

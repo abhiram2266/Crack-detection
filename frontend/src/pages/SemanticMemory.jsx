@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { analyzeImage, errorText, getSessions, getSites, imageUrl, searchMemory } from '../api'
-import { Card, ErrorBox, Field, fmt, Severity } from '../components/ui'
+import { Card, ErrorBox, Field, fmt, Severity, when } from '../components/ui'
 import { useAsync } from '../hooks'
 
 const ASSET_TYPES = ['solar_panel', 'building', 'utility_pole', 'machinery']
@@ -64,6 +64,8 @@ export default function SemanticMemory() {
             <dt>Condition</dt><dd>{result.condition.label} ({fmt(result.condition.confidence)})</dd>
             <dt>Severity</dt><dd><Severity score={result.severity_score} level={result.severity_level} /></dd>
             <dt>Identity</dt><dd>{result.asset_id ? <Link to={`/assets/${result.asset_id}`} className="mono">{result.asset_id}</Link> : 'new'} · {result.identity?.stage}</dd>
+            {result.history && <><dt>Memory</dt><dd>seen before · last checked {when(result.history.last_checked_ts)} · was <strong>{result.history.previous_condition}</strong></dd></>}
+            {result.context && <><dt>Site context</dt><dd>{result.context.level} (K = {fmt(result.context.score)}) · criticality ×{fmt(result.context.criticality_multiplier, 3)}<div className="small muted">{result.context.reasons.join(' · ')}</div></dd></>}
             {result.change && <><dt>Change M</dt><dd>{fmt(result.change.change_magnitude)} (condition {fmt(result.change.condition_delta)}, visual {fmt(result.change.visual_delta)})</dd></>}
             <dt>Class scores</dt>
             <dd className="small">{Object.entries(result.condition.scores || {}).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${fmt(v)}`).join(' · ')}</dd>

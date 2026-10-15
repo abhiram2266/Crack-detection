@@ -160,8 +160,9 @@ def test_fr4_briefing_and_fr18_report(config, embedder, classifier):
 
 def test_fr19_escalation_only_to_subscribed_maintenance(config, embedder, classifier):
     # The weight-free test classifier is low-confidence (Cf ≈ 0.55), so the critical level is
-    # lowered to make the synthetic crack critical; the escalation path itself is unchanged.
-    config = {**config, "severity": {**config["severity"], "levels": {**config["severity"]["levels"], "critical": 0.3}}}
+    # lowered to make the synthetic crack critical (and its extent ignored); the escalation path itself is unchanged.
+    sev = config["severity"]
+    config = {**config, "severity": {**sev, "levels": {**sev["levels"], "critical": 0.3}, "extent": {**sev["extent"], "enabled": False}}}
     store, engine, sync, mission = _stack(config, embedder, classifier, None)
     store.ensure_site("other", "Other site")
     pw = hash_password("x")
@@ -184,3 +185,27 @@ def test_fr19_escalation_only_to_subscribed_maintenance(config, embedder, classi
     assert {n["user_id"] for n in notes} == {maint["user_id"]}
     report = mission.end(sid)
     assert report["counts"]["escalations"] == 1
+
+
+def test_quick_start_reuses_a_nearby_site_or_creates_one(config, embedder, classifier, monkeypatch):
+    import ml.mission as mission_mod
+
+    monkeypatch.setattr(mission_mod, "place_name", lambda lat, lon, cfg: "Tambaram, Chennai")
+    store, engine, sync, mission = _stack(config, embedder, classifier, None)
+    here = {"latitude": 12.9246, "longitude": 80.1270, "accuracy_m": 30.0}
+    first = mission.quick_start("op", here)
+    q = first["quick_start"]
+    assert q["created"] and q["site"]["name"] == "Tambaram, Chennai"
+    sid = first["session"]["session_id"]
+    asset = engine.observe(make_panel(6), "solar_panel", sid)
+    mission.end(sid)
+
+    # ~50 m away, later: the same site, so the asset is recognised.
+    again = mission.quick_start("op", {"latitude": 12.92505, "longitude": 80.1270, "accuracy_m": 30.0})
+    assert not again["quick_start"]["created"] and again["session"]["site_id"] == q["site"]["site_id"]
+    ev = engine.observe(make_panel(6), "solar_panel", again["session"]["session_id"])
+    assert ev.asset_id == asset.asset_id and ev.history is not None
+    mission.end(again["session"]["session_id"])
+
+    far = mission.quick_start("op", {"latitude": 13.0806, "longitude": 80.2773})   # ~20 km away
+    assert far["quick_start"]["created"] and far["session"]["site_id"] != q["site"]["site_id"]

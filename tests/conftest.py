@@ -57,6 +57,7 @@ def config(tmp_path):
     cfg["cloud"]["server"]["db_url"] = f"sqlite:///{tmp_path}/cloud.db"
     cfg["cloud"]["server"]["secret_file"] = str(tmp_path / "cloud_secret")
     cfg["detection"]["mode"] = "full_frame"
+    cfg["context_risk"]["auto_refresh"] = False   # tests never call the real APIs
     return cfg
 
 

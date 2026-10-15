@@ -25,6 +25,13 @@ def build_report(store: LocalStore, session_id: str, sync_result: Dict[str, Any]
 
     assets = {a: store.get_asset(a) for a in latest}
 
+    # What memory held before this flight: each asset's last observation from an earlier session.
+    previous: Dict[str, Dict[str, Any]] = {}
+    for aid in latest:
+        earlier = [o for o in store.observations(aid) if o["session_id"] != session_id and o["observation_ts"] < session["started_ts"]]
+        if earlier:
+            previous[aid] = max(earlier, key=lambda o: o["observation_ts"])
+
     def entry(o: Dict[str, Any]) -> Dict[str, Any]:
         a = assets[o["asset_id"]] or {}
         return {
@@ -51,6 +58,22 @@ def build_report(store: LocalStore, session_id: str, sync_result: Dict[str, Any]
     confirmed = [entry(o) for o in latest.values() if o["status"] == "confirmed" and o["asset_id"] not in {f["asset_id"] for f in flagged}]
     new_assets = [entry(o) for o in observations if o["status"] == "new"]
 
+    revisited = []
+    for aid, o in latest.items():
+        p = previous.get(aid)
+        if p is None:
+            continue
+        revisited.append({
+            **entry(o),
+            "previous_inspection_ts": p["observation_ts"],
+            "previous_condition": p["condition_description"],
+            "previous_severity": round(p["severity_score"], 4),
+            "inspections_total": len(store.observations(aid)),
+            "condition_changed": p["condition_description"] != o["condition_description"],
+            "severity_delta": round(o["severity_score"] - p["severity_score"], 4),
+        })
+    revisited.sort(key=lambda e: e["severity_delta"], reverse=True)
+
     defects = []
     for aid in latest:
         for d in store.list_defects(asset_id=aid):
@@ -58,6 +81,9 @@ def build_report(store: LocalStore, session_id: str, sync_result: Dict[str, Any]
                 defects.append(
                     {k: d[k] for k in ("defect_id", "asset_id", "defect_type", "severity_score", "max_severity", "status", "first_detected_ts", "resolution_suggested")}
                 )
+
+    # Site context in force during the flight (snapshot stored with each observation).
+    context = next((o["metadata"].get("context") for o in reversed(observations) if o["metadata"].get("context")), None)
 
     return {
         "session": {k: session[k] for k in ("session_id", "site_id", "operator_id", "mission_date", "started_ts", "ended_ts", "mode", "assets_processed", "simulated")},
@@ -67,6 +93,7 @@ def build_report(store: LocalStore, session_id: str, sync_result: Dict[str, Any]
             "flagged": len(flagged),
             "confirmed": len(confirmed),
             "new_assets": len(new_assets),
+            "revisited": len(revisited),
             "open_defects": len(defects),
             "escalations": len(escalations),
         },
@@ -74,8 +101,10 @@ def build_report(store: LocalStore, session_id: str, sync_result: Dict[str, Any]
         "severity_ranking": [{"asset_id": f["asset_id"], "severity_score": f["severity_score"], "severity_level": f["severity_level"]} for f in flagged],
         "confirmed_assets": confirmed,
         "new_assets": new_assets,
+        "revisited_assets": revisited,
         "open_defects": defects,
         "escalations": escalations,
+        "context": context,
         "sync": sync_result,
     }
 
@@ -90,12 +119,20 @@ def _rows(items: List[Dict[str, Any]], cols: List[str]) -> str:
 
 FLAG_COLS = ["asset_id", "asset_type", "condition", "severity_score", "severity_level", "change_magnitude", "match_stage"]
 ASSET_COLS = ["asset_id", "asset_type", "condition", "observation_ts", "revisit_priority"]
+REVISIT_COLS = ["asset_id", "asset_type", "previous_inspection_ts", "previous_condition", "condition", "previous_severity", "severity_score", "severity_delta", "inspections_total"]
 DEFECT_COLS = ["defect_id", "asset_id", "defect_type", "severity_score", "status", "resolution_suggested"]
 
 
 def render_html(report: Dict[str, Any]) -> str:
     s = report["session"]
     c = report["counts"]
+    ctx = report.get("context")
+    ctx_html = (
+        f"<h2>Site context risk</h2><p>{html.escape(ctx['level'])} · K = {ctx['score']:.2f} · criticality ×{ctx['criticality_multiplier']:.2f}"
+        f" · data coverage {ctx['coverage']:.0%}</p><ul>" + "".join(f"<li>{html.escape(r)}</li>" for r in ctx["reasons"]) + "</ul>"
+        if ctx
+        else ""
+    )
     sim = "<p><strong>Simulated session</strong> — data generated for demonstration.</p>" if s.get("simulated") else ""
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>AUDI report {html.escape(s['session_id'])}</title>
 <style>body{{font-family:system-ui,sans-serif;margin:2rem;color:#1d2433}}table{{border-collapse:collapse;width:100%;margin-bottom:1.5rem}}
@@ -104,7 +141,9 @@ th,td{{border:1px solid #d5dae3;padding:4px 8px;font-size:13px;text-align:left}}
 <p>Session <code>{html.escape(s['session_id'])}</code> · site <code>{html.escape(s['site_id'])}</code> · operator {html.escape(str(s['operator_id']))} ·
 {html.escape(s['mission_date'])} · mode {html.escape(s['mode'])}</p>
 <p>Assets processed {c['assets_processed']} · flagged {c['flagged']} · confirmed {c['confirmed']} · new {c['new_assets']} · open defects {c['open_defects']} · escalations {c['escalations']}</p>
+{ctx_html}
 <h2>Flagged defects (by severity)</h2>{_rows(report['flagged_defects'], FLAG_COLS)}
+<h2>Re-inspected assets (compared with their previous inspection)</h2>{_rows(report.get('revisited_assets', []), REVISIT_COLS)}
 <h2>Newly registered assets</h2>{_rows(report['new_assets'], ASSET_COLS)}
 <h2>Confirmed assets</h2>{_rows(report['confirmed_assets'], ASSET_COLS)}
 <h2>Open defects</h2>{_rows(report['open_defects'], DEFECT_COLS)}
@@ -158,6 +197,7 @@ def render_pdf(report: Dict[str, Any]) -> bytes:
         story.append(t)
 
     table("Flagged defects (by severity)", report["flagged_defects"], FLAG_COLS)
+    table("Re-inspected assets (vs previous inspection)", report.get("revisited_assets", []), ["asset_id", "previous_inspection_ts", "previous_condition", "condition", "previous_severity", "severity_score"])
     table("Newly registered assets", report["new_assets"], ASSET_COLS)
     table("Confirmed assets", report["confirmed_assets"], ASSET_COLS)
     table("Open defects", report["open_defects"], DEFECT_COLS)

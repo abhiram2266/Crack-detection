@@ -20,6 +20,9 @@ router = APIRouter(tags=["sessions"])
 class StartRequest(BaseModel):
     site_id: str
     simulated: bool = False
+    latitude: Optional[float] = None     # device position (browser geolocation), used to locate a site
+    longitude: Optional[float] = None    # that has no coordinates yet
+    accuracy_m: Optional[float] = None
 
 
 @router.get("/api/sites")
@@ -34,10 +37,24 @@ def briefing(site_id: str, _: Dict = Depends(field_roles), services: Services = 
     return services.mission.briefing(site_id)
 
 
+@router.get("/api/sites/{site_id}/context")
+def site_context(site_id: str, _: Dict = Depends(any_user), services: Services = Depends(get_services)) -> Dict[str, Any]:
+    """Cached context risk of a site (real weather, seismic, building data) and admin-entered attributes."""
+    site = services.store.get_site(site_id)
+    if site is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown site {site_id}")
+    return {"site": site, "context": services.context.for_site(site_id), "attributes": services.context.attributes(site_id)}
+
+
 @router.post("/api/sessions/start")
 def start_session(body: StartRequest, user: Dict = Depends(operator_only), services: Services = Depends(get_services)) -> Dict[str, Any]:
     try:
-        return services.mission.start(body.site_id, user["username"], simulated=body.simulated)
+        location = (
+            {"latitude": body.latitude, "longitude": body.longitude, "accuracy_m": body.accuracy_m}
+            if body.latitude is not None and body.longitude is not None
+            else None
+        )
+        return services.mission.start(body.site_id, user["username"], simulated=body.simulated, location=location)
     except KeyError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
 
@@ -52,6 +69,26 @@ def end_session(session_id: str, _: Dict = Depends(operator_only), services: Ser
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown session {session_id}") from exc
     except SessionStateError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+
+class QuickStartRequest(BaseModel):
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    accuracy_m: Optional[float] = None
+
+
+@router.post("/api/sessions/quick-start")
+def quick_start(body: QuickStartRequest, user: Dict = Depends(operator_only), services: Services = Depends(get_services)) -> Dict[str, Any]:
+    """Start inspecting here: reuse the site inspected before near this position, or create one."""
+    location = (
+        {"latitude": body.latitude, "longitude": body.longitude, "accuracy_m": body.accuracy_m}
+        if body.latitude is not None and body.longitude is not None
+        else None
+    )
+    try:
+        return services.mission.quick_start(user["username"], location)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
 
 @router.get("/api/sessions")

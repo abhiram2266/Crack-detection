@@ -32,6 +32,7 @@ from ml.change_detector import (
 )
 from ml.condition_classifier import NORMAL_LABEL, ConditionClassifier, ConditionPrediction
 from ml.config import cfg, resolve_path
+from ml.context_risk import ContextRiskService, effective_criticality, summary as context_summary
 from ml.detector import Detection, Detector
 from ml.embedding_model import AssetEmbeddingModel
 from ml.imaging import crop as crop_image
@@ -72,6 +73,7 @@ class AssetEvent:
     defect: Optional[Dict[str, Any]] = None
     revisit: Optional[Dict[str, float]] = None
     history: Optional[Dict[str, Any]] = None     # FR-12: what memory held for a matched asset
+    context: Optional[Dict[str, Any]] = None     # site context risk applied to criticality (ml/context_risk.py)
     image_reference: Optional[str] = None
     heatmap_reference: Optional[str] = None
     latency_ms: Dict[str, float] = field(default_factory=dict)
@@ -129,6 +131,7 @@ class SemanticMemoryEngine:
         self._listeners: List[Listener] = []
         self._session_cache: Dict[str, Dict[str, Any]] = {}
         self._site_cache: Dict[str, Any] = {}
+        self.context: Optional[ContextRiskService] = None   # set by the service container
         self._lock = threading.RLock()
         self._sync_backbone()
         self._load_index()
@@ -397,11 +400,41 @@ class SemanticMemoryEngine:
                     ref_dict["label"], ref_dict["scores"], ref_dict["is_defect"], ref_dict["defect_type"]
                 )
                 change: ChangeAssessment = self.change_detector.assess(pred, reference, crop, reference_image, homography)
+                # Change since the PREVIOUS inspection (the reference above is the last confirmed state,
+                # which for a known defect is its healthy baseline).
+                previous = None if identity.is_new else self.store.latest_observation(identity.asset_id)
+                since_last = self._since_last(pred, crop, previous) if previous else None
                 lat["change"] = (time.perf_counter() - t) * 1000
 
-                criticality = asset_criticality(det.asset_type, self.config)
-                severity, significant = gated_severity(change.magnitude, criticality, cf, self.config)
+                t = time.perf_counter()
+                extent = self._defect_extent(crop, pred, det.asset_type) if pred.is_defect else None
+                lat["extent"] = (time.perf_counter() - t) * 1000
+
+                site_context = self.context.for_site(site_id) if self.context else None
+                criticality = effective_criticality(asset_criticality(det.asset_type, self.config), site_context)
+                ev.context = context_summary(site_context)
+                severity, significant = gated_severity(change.magnitude, criticality, cf, self.config, extent)
                 ev.change = change.to_dict()
+                ev.change["extent"] = extent
+                if since_last is not None:
+                    prev_extent = (previous.get("meta") or {}).get("extent")
+                    growth = extent - prev_extent if extent is not None and prev_extent is not None else None
+                    if growth is not None and growth >= float(cfg(self.config, "severity", "extent", "growth_threshold")):
+                        since_last.significant = True   # same defect type, but it has grown
+                    ev.change["since_last_visit"] = {
+                        "change_magnitude": since_last.magnitude,
+                        "condition_delta": since_last.condition_delta,
+                        "visual_delta": since_last.visual_delta,
+                        "significant": since_last.significant,
+                        "previous_ts": previous["observation_ts"],
+                        "previous_condition": previous["condition_description"],
+                        "previous_severity": previous["severity_score"],
+                        "previous_extent": prev_extent,
+                        "extent_growth": growth,
+                    }
+                    if significant and not since_last.significant:
+                        # Known defect, unchanged since the last visit: it keeps the severity it had.
+                        severity = float(previous["severity_score"])
                 ev.severity_score = severity
                 ev.severity_level = severity_level(severity, self.config)
                 ev.priority = is_priority(severity, self.config)
@@ -497,7 +530,10 @@ class SemanticMemoryEngine:
             "altitude": geo.altitude if geo else None,
             "bbox": list(det.bbox),
             "simulated": bool(session.get("simulated")),
-            "meta": {"detector_label": det.label, "identity": identity.to_dict()},
+            "meta": {
+                "detector_label": det.label, "identity": identity.to_dict(), "context": ev.context,
+                "criticality": criticality, "extent": (ev.change or {}).get("extent"),
+            },
         }
         if is_new:
             asset = {
@@ -545,6 +581,52 @@ class SemanticMemoryEngine:
         ev.heatmap_reference = heat_ref
         ev.defect = result["defect"]
         ev.revisit = result["revisit"]
+
+    def _defect_extent(self, crop: Image.Image, pred: ConditionPrediction, asset_type: str) -> Optional[float]:
+        """Defect size E ∈ [0, 1]: mean probability of the predicted defect over a grid of overlapping tiles.
+
+        The classifier only says whether the crop shows a crack, not how much of it; run on tiles,
+        the share of the surface it flags tracks the crack's length and width (a hairline crack lights
+        up one or two tiles, a long open one most of them).
+        """
+        if not cfg(self.config, "severity", "extent", "enabled") or pred.label not in pred.scores:
+            return None
+        n = int(cfg(self.config, "severity", "extent", "grid"))
+        w, h = crop.size
+        tw, th = 2 * w / (n + 1), 2 * h / (n + 1)
+        tiles = [
+            crop.crop((int(j * w / (n + 1)), int(i * h / (n + 1)), int(j * w / (n + 1) + tw), int(i * h / (n + 1) + th)))
+            for i in range(n)
+            for j in range(n)
+        ]
+        preds = self.classifier.predict_embeddings(self.embedder.encode_batch(tiles), asset_type)
+        return float(np.mean([p.scores.get(pred.label, 0.0) for p in preds]))
+
+    def _since_last(self, pred: ConditionPrediction, crop: Image.Image, previous: Dict[str, Any]) -> ChangeAssessment:
+        """Change since the previous observation: M' = α'·condition + (1 − α')·aligned visual change.
+
+        α' = change_detection.since_last_alpha. Webcam captures of the same scene vary a lot visually
+        (glare, moiré, exposure), so by default (α' = 1) the condition decides and the visual part is
+        reported only.
+        """
+        ref = ReferenceCondition(
+            previous["condition_description"], previous["condition_scores"], previous["is_defect"], previous["defect_type"]
+        )
+        img = H = None
+        if previous.get("image_reference"):
+            path = self.store.image_path(previous["image_reference"])
+            if path.exists():
+                img = Image.open(path).convert("RGB")
+                v = self.identifier.verifier
+                inliers, ratio, h = v.verify(v.extract(crop), v.extract(img))
+                H = h if h is not None and v.accepts(inliers, ratio) else None
+        c = self.change_detector.assess(pred, ref, crop, img, H)
+        alpha = float(cfg(self.config, "change_detection", "since_last_alpha"))
+        b = c.visual_delta
+        m = c.condition_delta if b is None else alpha * c.condition_delta + (1 - alpha) * b
+        c.magnitude = float(m)
+        c.significant = m >= float(cfg(self.config, "change_detection", "threshold"))
+        return c
 
     # ── history (FR-12) ───────────────────────────────────────────────────
     def _history_summary(self, asset_row: Dict[str, Any]) -> Dict[str, Any]:

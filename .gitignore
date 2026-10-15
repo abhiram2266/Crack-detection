@@ -8,8 +8,12 @@ dataset/raw/
 dataset/processed/
 dataset/small/
 data/
-models/
+models/*
+!models/condition_classifier.pt
+!models/asset_type_classifier.npz
+!models/yolov8s-worldv2.pt
 *.pt
+!models/*.pt
 *.pth
 *.onnx
 

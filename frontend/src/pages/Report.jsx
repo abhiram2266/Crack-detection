@@ -71,9 +71,37 @@ export default function Report() {
             <Stat label="Flagged" value={r.counts.flagged} tone={r.counts.flagged ? 'crit' : ''} />
             <Stat label="Confirmed" value={r.counts.confirmed} />
             <Stat label="New assets" value={r.counts.new_assets} />
+            <Stat label="Seen before" value={r.counts.revisited ?? 0} />
             <Stat label="Open defects" value={r.counts.open_defects} />
             <Stat label="Escalations" value={r.counts.escalations} tone={r.counts.escalations ? 'warn' : ''} />
           </div>
+          {r.context && (
+            <Card title={`Site context risk · ${r.context.level} (K = ${fmt(r.context.score)})`}>
+              <p className="small muted">Criticality ×{fmt(r.context.criticality_multiplier, 3)} · data coverage {Math.round(r.context.coverage * 100)}%</p>
+              <ul className="small">{r.context.reasons.map((x) => <li key={x}>{x}</li>)}</ul>
+            </Card>
+          )}
+          <Card title="Re-inspected assets: this flight vs their previous inspection">
+            {!(r.revisited_assets || []).length ? <Empty>No asset from an earlier flight was seen.</Empty> : (
+              <table className="table">
+                <thead><tr><th /><th>Asset</th><th>Type</th><th>Previous inspection</th><th>Then</th><th>Now</th><th>Severity then → now</th><th>Inspections</th></tr></thead>
+                <tbody>
+                  {r.revisited_assets.map((a) => (
+                    <tr key={a.asset_id}>
+                      <td>{a.image_reference && <img src={imageUrl(a.image_reference)} alt="" className="thumb" />}</td>
+                      <td><Link to={`/assets/${a.asset_id}`} className="mono">{a.asset_id}</Link></td>
+                      <td>{a.asset_type}</td>
+                      <td>{when(a.previous_inspection_ts)}</td>
+                      <td>{a.previous_condition}</td>
+                      <td><strong>{a.condition}</strong>{a.condition_changed && <span className="pill warn"> changed</span>}</td>
+                      <td>{fmt(a.previous_severity)} → <Severity score={a.severity_score} level={a.severity_level} /></td>
+                      <td>{a.inspections_total}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </Card>
           <Card title="Flagged defects (by severity)"><Rows items={r.flagged_defects} flagged /></Card>
           <Card title="Newly registered assets"><Rows items={r.new_assets} /></Card>
           <Card title="Confirmed assets (no significant change)"><Rows items={r.confirmed_assets} /></Card>

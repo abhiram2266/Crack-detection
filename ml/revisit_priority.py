@@ -1,6 +1,6 @@
 """Revisit priority, SRS §8.2 with the amendments in docs/SRS_AMENDMENTS.md.
 
-R = w3·Sr + w4·T + w5·D
+R = w3·Sr + w4·T + w5·D + w6·K
   Sr latest severity of the asset.
   T  severity trend over the last N missions (revisit_priority.trend_window):
      least-squares slope of per-mission severity (severity per mission index)
@@ -8,6 +8,7 @@ R = w3·Sr + w4·T + w5·D
      [0, 1]. Falling or flat trends give 0 (D15).
   D  min(1, days since last inspection / max_days_since_inspection), evaluated
      at query time ("now"), so it keeps growing between missions (D9).
+  K  context score of the asset's site (ml/context_risk.py), 0 when unknown.
 """
 
 from __future__ import annotations
@@ -49,15 +50,18 @@ def compute_revisit(
     last_inspection: Optional[str | datetime],
     config: Dict,
     now: Optional[datetime] = None,
+    context_score: float = 0.0,
 ) -> Dict[str, float]:
     rp = cfg(config, "revisit_priority")
     sr = max(0.0, min(1.0, float(mission_severities[-1]) if mission_severities else 0.0))
     t = calculate_trend(mission_severities, int(rp["trend_window"]))
     d = time_decay(last_inspection, now, float(rp["max_days_since_inspection"]))
-    r = float(rp["w3"]) * sr + float(rp["w4"]) * t + float(rp["w5"]) * d
+    k = max(0.0, min(1.0, float(context_score)))
+    r = float(rp["w3"]) * sr + float(rp["w4"]) * t + float(rp["w5"]) * d + float(rp.get("w6", 0.0)) * k
     return {
         "recent_severity": sr,
         "trend": t,
         "days_since_inspection": d,
+        "context": k,
         "revisit_priority": max(0.0, min(1.0, r)),
     }

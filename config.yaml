@@ -13,7 +13,9 @@ model:
   # The embedding dimension is derived from the loaded model at runtime (D12).
 
 detection:
-  mode: "yolo_world"                # yolo_world | full_frame (whole frame = one asset, desk demos)
+  mode: "auto"                      # auto (YOLO-World boxes, else typed whole frame) | yolo_world | full_frame
+  auto_use_yolo: false              # auto: try YOLO-World boxes first (drone footage of whole scenes); off for
+                                    #   close-ups, where it boxes desk objects as machinery
   weights: "models/yolov8s-worldv2.pt"
   text_encoder_dir: "models/weights"      # CLIP text encoder used to embed the prompts
   onnx_export: false                # export to models/*.onnx on first load and run via ONNX
@@ -65,10 +67,31 @@ condition_classifier:
     hflip_prob: 0.5
     crop_scale_min: 0.7
 
+asset_type_classifier:              # training/train_asset_type_classifier.py — type of a close-up (auto detection)
+  checkpoint: "models/asset_type_classifier.npz"
+  metrics_path: "reports/train/asset_type_classifier_metrics.json"
+  train_per_type: 400
+  test_per_type: 150
+  regularization_c: 1.0
+  augment_views: 2                  # degraded (webcam / screen-capture) copies per training image
+  min_confidence: 0.55              # auto mode: fused type probability below this → frame is not an asset
+  clip:                             # zero-shot CLIP (the YOLO-World text encoder's model) — robust on webcam/screen
+    enabled: true                   #   frames; it also has a "none" class that rejects blurry / empty frames
+    model: "ViT-B/32"
+    download_root: "models/weights/clip"
+    weight: 0.7                     # fused p(type) = weight·CLIP + (1 − weight)·trained classifier
+    max_none: 0.4                   # CLIP p(none) at or above this → frame is not an asset
+    prompts:
+      building: ["a photo of a building wall", "a photo of a concrete wall with a crack", "a photo of a building facade"]
+      solar_panel: ["a photo of a solar panel"]
+      utility_pole: ["a photo of a utility pole", "a photo of a power line insulator"]
+      machinery: ["a photo of a machine part", "a photo of a metal pipe", "a photo of an industrial machine"]
+      none: ["a photo of a room", "a photo of a person", "a blank screen", "a photo of a desk"]
+
 matching:
   top_k: 5
   shortlist_min_similarity: 0.30    # candidates below this global cosine are not geometrically verified
-  visual_only_similarity: 0.93      # accept without geometry only when neither image has enough keypoints
+  visual_only_similarity: 0.80      # accept without geometry only when neither image has enough keypoints (plain walls: SIFT finds ~0; hand-held re-shots of the same crack score 0.80-0.95)
   location_radius_m: 25.0
   feature: "sift"                   # sift | orb
   max_keypoints: 1500
@@ -99,6 +122,8 @@ tracker:
 change_detection:
   threshold: 0.30                   # M below this ⇒ no significant change ⇒ S = 0, asset confirmed
   alpha: 0.7                        # M = α·a + (1−α)·b
+  since_last_alpha: 1.0             # change since the PREVIOUS visit: α'·a + (1−α')·b; 1.0 = condition decides
+                                    #   (webcam captures of one unchanged scene measured b 0.24–1.0, median 0.69)
   condition_l1_weight: 0.5          # a = 0.5·L1(scores) + steps
   defect_flip_step: 0.5             # added when is_defect flips False → True
   defect_type_change_step: 0.3      # added when defect_type changes between defects
@@ -111,6 +136,11 @@ change_detection:
 severity:
   w1: 0.6
   w2: 0.4
+  extent:                           # defect size: the condition classifier run on a grid of overlapping tiles
+    enabled: true
+    grid: 4                         # grid × grid tiles, each 2/(grid+1) of the crop side
+    floor: 0.2                      # S = (w1·M·(floor + (1−floor)·E) + w2·C)·Cf, E = mean defect prob over tiles
+    growth_threshold: 0.15          # E rising this much since the last visit counts as a significant change
   priority_threshold: 0.5
   levels:                           # lower bounds; highest matching level wins
     low: 0.0
@@ -122,8 +152,72 @@ revisit_priority:
   w3: 0.5
   w4: 0.3
   w5: 0.2
+  w6: 0.15                          # site context score K (ml/context_risk.py); R clipped to [0,1]
   max_days_since_inspection: 30.0
   trend_window: 5                   # N missions used for the trend slope (D15)
+
+context_risk:                       # ml/context_risk.py — real site context → K ∈ [0,1]
+  enabled: true
+  auto_refresh: true                # fetch in the background on site creation / mission start
+  auto_locate_ip: true              # a site without coordinates and no device position: locate by public IP (city level)
+  region_file: "ml/regions/chennai.json"
+  cache_ttl_hours: 6.0              # re-fetch weather etc. when the cached data is older than this
+  http_timeout_s: 30.0              # Overpass (OpenStreetMap) can take ~30 s when busy
+  user_agent: "AUDI-inspection-research/1.0"
+  timezone: "Asia/Kolkata"
+  criticality_gain: 0.5             # C' = min(1, C·(1 + gain·K))
+  weights:                          # design choice (expert-set, not learned); unavailable factors drop out
+    seismic_zone: 0.20
+    seismic_history: 0.10
+    rain_forecast: 0.20
+    rain_antecedent: 0.15
+    wind_forecast: 0.10
+    occupancy: 0.15
+    building_age: 0.10
+  levels: {moderate: 0.33, high: 0.66}
+  rainfall:
+    past_days: 30
+    forecast_days: 7
+    heavy_day_mm: 115.6             # IMD "very heavy rainfall" lower bound (mm in 24 h) → score 1
+    antecedent_full_mm: 300.0       # past-30-day total that maps to score 1
+  wind:
+    full_gust_kmh: 118.0            # IMD "very severe cyclonic storm" lower bound (64 kt) → score 1
+  earthquakes:
+    radius_km: 300
+    min_magnitude: 3.0
+    start: "1900-01-01"
+    zero_magnitude: 3.0             # largest nearby magnitude mapped linearly 3.0 → 0 … 6.5 → 1
+    full_magnitude: 6.5
+  building_age:
+    full_age_years: 60
+  osm_building_radius_m: 25
+  occupancy_scores:                 # OpenStreetMap amenity / building / landuse value → exposure
+    hospital: 1.0
+    school: 1.0
+    kindergarten: 1.0
+    college: 0.9
+    university: 0.9
+    clinic: 0.9
+    place_of_worship: 0.8
+    apartments: 0.8
+    dormitory: 0.8
+    residential: 0.7
+    hotel: 0.7
+    commercial: 0.6
+    retail: 0.6
+    office: 0.6
+    house: 0.5
+    industrial: 0.5
+    warehouse: 0.3
+  endpoints:
+    open_meteo: "https://api.open-meteo.com/v1/forecast"
+    usgs: "https://earthquake.usgs.gov/fdsnws/event/1/query"
+    nominatim: "https://nominatim.openstreetmap.org/search"
+    nominatim_reverse: "https://nominatim.openstreetmap.org/reverse"   # OSM fallback when Overpass is busy
+    ip_geolocation: "https://ipwho.is/"
+    overpass:
+      - "https://overpass-api.de/api/interpreter"
+      - "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
 
 defects:
   resolution_suggestion_missions: 3 # consecutive normal missions before suggesting resolution
@@ -158,6 +252,7 @@ memory:
 sites:
   default_site_id: "site_demo"
   default_site_name: "Demo site"
+  quick_start_radius_m: 200         # quick start reuses a site within this distance (memory is per site)
 
 memory_build:                       # scripts/build_semantic_memory.py — simulated history via the real pipeline
   site_id: "site_simulated"

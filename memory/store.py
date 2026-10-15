@@ -173,6 +173,16 @@ class LocalStore:
                     self._enqueue(s, "site", site_id, site_id, _row(site))
             return _row(site)
 
+    def set_site_location(self, site_id: str, latitude: float, longitude: float, enqueue: bool = True) -> Dict:
+        with self.txn() as s:
+            site = s.get(db.Site, site_id)
+            if site is None:
+                raise KeyError(site_id)
+            site.latitude, site.longitude = float(latitude), float(longitude)
+            if enqueue:
+                self._enqueue(s, "site", site_id, site_id, _row(site))
+            return _row(site)
+
     def list_sites(self) -> List[Dict]:
         with self.read() as s:
             return [_row(x) for x in s.scalars(select(db.Site).order_by(db.Site.site_id))]
@@ -390,7 +400,10 @@ class LocalStore:
             return self._mission_severities(s, asset_id)
 
     def _apply_revisit(self, s: OrmSession, asset: db.Asset, now: Optional[datetime]) -> Dict[str, float]:
-        comp = compute_revisit(self._mission_severities(s, asset.asset_id), asset.last_checked_ts, self.config, now)
+        enabled = (self.config.get("context_risk") or {}).get("enabled", False)
+        ctx = s.get(db.Meta, f"context_risk:{asset.site_id}") if enabled else None
+        k = ((ctx.value or {}).get("result") or {}).get("score", 0.0) if ctx else 0.0
+        comp = compute_revisit(self._mission_severities(s, asset.asset_id), asset.last_checked_ts, self.config, now, k)
         asset.revisit_priority_score = comp["revisit_priority"]
         asset.revisit_components = comp
         return comp
